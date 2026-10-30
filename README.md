@@ -1,10 +1,21 @@
-# Datsun 280Z strut isolator - FreeCAD model, FEM and casting core
+# Datsun 280Z strut isolator: FreeCAD model, FEM and casting core
+
+<p align="center"><img src="images/section_axis.png" width="760" alt="Cross-section through the axis: outer shell, housing top, rubber, stud and the blue casting core"></p>
+
+**What this is.** The rubber in a Datsun 280Z (S30) strut top isolator has failed. This repo holds a parametric FreeCAD model of
+the part, a stiffness check of the original rubber, and a printable casting core for refilling it with polyurethane.
+The model was reverse-engineered from two 3D scans. The blue part in the section above is the removable core that keeps the service
+opening free while the PU cures; the rest is steel (grey) and the original rubber volume (orange).
+
+**Is it finished?** The geometry and the core are done; the PU repair itself is not yet tested. The fit of the core against the real
+parts and the D-flat angle are the main things still to verify (see "Unknowns" below).
 
 Reverse-engineered from two Revopoint scans (`1009_01_mesh.ply` outer pressed shell, `1009_02_mesh.ply` housing top) of a failed
 rubber strut isolator. Goal: repair by casting polyurethane into the cavity, with a removable core that keeps the
 trilobal service opening free (it gives access to the nut on the strut shaft through the D-shaped hole).
 
-The scans (about 150 MB) are not in the repo; GitHub rejects files over 100 MB. Keep them elsewhere.
+The raw scans are in `scans/` as lossless xz archives (19 MB and 40 MB; the uncompressed PLY files are 49 MB and 101 MB and are git-ignored,
+because GitHub rejects files over 100 MB). Unpack with `xz -dk scans/1009_01_mesh.ply.xz scans/1009_02_mesh.ply.xz`.
 
 ## Layout
 | Path | What |
@@ -15,7 +26,8 @@ The scans (about 150 MB) are not in the repo; GitHub rejects files over 100 MB. 
 | `step/` | outer shell (1.0 mm), housing top (2.0 mm), original rubber volume, casting core |
 | `print/` | casting core STL; `casting_core_print_orientation.stl` is turned foot-down for FDM |
 | `fem/` | CalculiX results as surface data (`fem_surface.json`), animations, `make_gifs.py` |
-| `images/` | cut-away views |
+| `images/` | cross-section through the axis |
+| `scans/` | Revopoint PLY scans, xz-compressed (lossless) |
 | `analysis/` | scan-fitting helper scripts (PLY loader, spline and trilobal fits) |
 
 ## Model
@@ -33,6 +45,15 @@ Shared axis = Z, outer shell top face at z = 0.
 - Sheet thicknesses (1.0 / 2.0 mm assumed), stud embed, rubber bottom recess depth.
 
 ## FEM (CalculiX via FreeCAD, rubber only, bonded)
+### FEM animations
+Original rubber, cut in half, 1 mm of housing travel (shown 8x, colour = stress). Red marks the spots that work hardest: around the
+studs and at the housing interface.
+
+| Axial (up/down) | Radial (sideways) |
+|---|---|
+| <img src="fem/axial.gif" width="420"> | <img src="fem/radial.gif" width="420"> |
+
+
 Linear elastic, E = 4.2 MPa, nu = 0.49 (about 60 Shore A), 1 mm housing displacement, shell and studs fixed:
 - axial 592 N/mm, radial 840 N/mm (housing nodes free to slide in plane; a rigid-body housing is stiffer: about 760 N/mm axial).
 - Nonlinear Neo-Hookean (G = 1.4 MPa, K = 70 MPa), 3 kN axial: 3.7 mm squash (750 N: 1.0 mm, 1.5 kN: 1.9 mm, 2.25 kN: 2.8 mm).
