@@ -1,0 +1,393 @@
+# -*- coding: utf-8 -*-
+"""
+Datsun 280Z strut isolator  (v6.1)  --  reverse-engineered from Revopoint scans 1009_01 / 1009_02
+=====================================================================================
+    OUTER SHELL   scan 1: pressed cup, trilobal opening + stamped lip, 3 bolt holes (collars)
+    HOUSING TOP   scan 2: inner pressed cup, D shaft hole, collar, rolled-in rim
+    STUDS         3 x M10x1.25 cast in the bolt holes (length/embed are ASSUMPTIONS)
+    RUBBER        volume between the sheets (trilobal void hollow down to the housing face,
+                  recessed bottom) = what the PU pour replaces
+    CASTING CORE  removable mould insert that keeps the trilobal void open (1.5 deg draft).
+                  Shoulder (flange) rests on the shell top face -> sets the height;
+                  D-shaped peg through the housing D hole + pocket around the D collar -> registers/centres
+                  the housing so it cannot drift; tall foot so the whole assembly can be turned upside down
+                  and poured through the open cavity with the studs hanging clear of the bench.
+
+Shared axis = global Z.  Outer shell top z = 0.  Housing plate at z = PLATE_Z2 (rim LIP_BELOW under the shell rim).
+Sheets: scanned skin as SURFACE (sketch + Part::Revolution + faces) and a solid with real thickness built directly
+(exact analytic offset of the scanned spline) -- Part::Offset(Fill) fails on these shapes in FreeCAD 1.1.
+
+Run the macro: it builds everything in a new document "StrutIsolator".
+Set EXPORT_DIR below to also write STEP files + casting_core.stl + the .FCStd.
+"""
+import math, os
+import FreeCAD as App
+import Part
+import Sketcher
+from FreeCAD import Vector as V
+
+# ------------------------------------------------------------------ parameters (mm, deg)
+T_OUTER     = 1.0
+LIP_DEPTH   = 8.1
+HOLE_COLLAR = 3.2
+Z_BOT       = -59.3
+R_FLAT      = 42.5
+PHASE       = 54.9
+BOLT_R, BOLT_D, N_HOLES = 34.85, 13.3, 3
+TRI_RHO0, TRI_T, TRI_A  = 21.451, 17.514, 16.371
+OUTER_POLES = [(54.850, -59.300), (56.057, -44.586), (51.635, -27.302), (48.721, -8.404),
+               (47.230, -2.694), (45.261, -1.008), (43.869, -0.110), (43.642, 0.000), (R_FLAT, 0.000)]
+OUTER_KNOTS = [0.0, 0.65992, 0.8442, 0.91713, 0.94077, 0.95637, 1.0]
+OUTER_MULTS = [4, 1, 1, 1, 1, 1, 4]
+
+T_HOUSING   = 2.0
+LIP_BELOW   = 2.5
+D_R, D_FLAT = 6.36, 4.85
+D_CENTRE    = (0.0, 0.0)
+D_ANGLE     = -87.3            # arbitrary relative to part 1 -- set to the real orientation
+D_COLLAR    = 4.9
+R_PLATE2    = 24.0
+W_RIM       = 23.70
+PLATE_Z2    = (Z_BOT - LIP_BELOW) + W_RIM
+_HOUSING_RW = [(24.0, 0.0), (24.695, 0.0), (25.23, -0.009), (26.404, 0.314), (26.971, 3.458), (26.11, 9.585),
+               (29.297, 17.233), (31.966, 21.644), (33.19, 23.7)]
+HOUSING_POLES = [(r, PLATE_Z2 - w) for (r, w) in _HOUSING_RW]
+HOUSING_KNOTS = [0.0, 0.06856, 0.0811, 0.10777, 0.42503, 0.73776, 1.0]
+HOUSING_MULTS = [4, 1, 1, 1, 1, 1, 4]
+SPLINE_DEG = 3
+
+STUD_D        = 10.0           # M10x1.25 (modelled as plain cylinder)
+STUD_EXPOSED  = 15.0           # above the shell top face (z = 0)
+STUD_EMBED    = 22.0           # below z = 0 inside the rubber  (ASSUMPTION - tune)
+RUBBER_RECESS = 2.0            # rubber bottom face sits this far above the outer shell rim (ASSUMPTION)
+FILL_BOLT_HOLES = True         # rubber fills the annulus between stud and bolt-hole collar
+
+CORE_DRAFT    = 1.5            # deg, makes the core pull out of the cured PU
+CORE_CLEAR    = 0.15           # mm, body smaller than the steel opening (print tolerance)
+SHOULDER_T    = 6.0            # mm, flange resting on the shell top face (z = 0 .. SHOULDER_T)
+SHOULDER_MARGIN = 4.0          # mm, flange outline = trilobal offset outward (auto-reduced to clear the studs)
+SHOULDER_ANGLE = 50.0         # deg from horizontal of the conical fillet under the shoulder (>= 45 prints without support)
+CORE_FOOT     = 26.0           # mm of foot above the shoulder (stands on the bench when inverted)
+PEG_DEPTH     = 10.0           # mm, D peg below the housing plate face (into the housing interior)
+PEG_CLEAR     = 0.20           # mm, peg smaller than the D hole
+POCKET_CLEAR  = 0.25           # mm, pocket around the D collar
+
+EXPORT_DIR = ""                # e.g. "/Users/you/StrutIsolator_FEM"  -> exports STEP/STL + saves the .FCStd
+
+# ------------------------------------------------------------------ pure geometry
+def trilobal_geometry():
+    s = TRI_RHO0 + TRI_T
+    d = (s - math.sqrt(4 * (TRI_A + TRI_T) ** 2 - 3 * s * s)) / 2.0
+    Tc = (s, 0.0); Lc = (d * 0.5, d * math.sqrt(3) / 2.0)
+    u = (Lc[0] - Tc[0], Lc[1] - Tc[1]); n = math.hypot(*u); u = (u[0] / n, u[1] / n)
+    X = (Tc[0] + u[0] * TRI_T, Tc[1] + u[1] * TRI_T)
+    a_tooth = math.atan2(X[1] - Tc[1], X[0] - Tc[0]); a_lobe = math.atan2(X[1] - Lc[1], X[0] - Lc[0])
+    arcs = []
+    for kk in range(3):
+        ph = math.radians(PHASE + 120.0 * kk)
+        Tk = (s * math.cos(ph), s * math.sin(ph)); Lk = (d * math.cos(ph + math.pi / 3), d * math.sin(ph + math.pi / 3))
+        arcs.append(dict(c=Tk, r=TRI_T, a0=a_tooth + ph, a1=(2 * math.pi - a_tooth) + ph))
+        arcs.append(dict(c=Lk, r=TRI_A, a0=a_lobe + ph, a1=(2 * math.pi / 3 - a_lobe) + ph))
+    return arcs, d
+
+def hole_centres():
+    return [(BOLT_R * math.cos(math.radians(PHASE + 360.0 * k / N_HOLES)),
+             BOLT_R * math.sin(math.radians(PHASE + 360.0 * k / N_HOLES))) for k in range(N_HOLES)]
+
+def d_geometry():
+    phi = math.radians(D_ANGLE); al = math.acos(D_FLAT / D_R)
+    a0, a1 = phi + al, phi + 2 * math.pi - al
+    cx, cy = D_CENTRE
+    return dict(c=D_CENTRE, r=D_R, a0=a0, a1=a1,
+                p0=(cx + D_R * math.cos(a0), cy + D_R * math.sin(a0)),
+                p1=(cx + D_R * math.cos(a1), cy + D_R * math.sin(a1)))
+
+def _warn(m): App.Console.PrintWarning(m + "\n")
+def _info(m): App.Console.PrintMessage(m + "\n")
+
+# ------------------------------------------------------------------ surface-model helpers
+def spline_revolution(doc, grp, prefix, poles, knots, mults):
+    sk = doc.addObject("Sketcher::SketchObject", prefix + "ProfileSketch")
+    sk.Placement = App.Placement(V(0, 0, 0), App.Rotation(V(1, 0, 0), 90))
+    bs = Part.BSplineCurve()
+    bs.buildFromPolesMultsKnots([V(r, z, 0) for (r, z) in poles], mults, knots, False, SPLINE_DEG)
+    sk.addGeometry(bs, False)
+    try: sk.exposeInternalGeometry(0)
+    except Exception as e: _warn("exposeInternalGeometry skipped: %s" % e)
+    doc.recompute()
+    ebb = sk.Shape.BoundBox; side = None
+    try:
+        rev = doc.addObject("Part::Revolution", prefix + "Side")
+        rev.Source = sk; rev.AxisLink = (sk, ["V_Axis"]); rev.Angle = 360.0; rev.Solid = False
+        doc.recompute(); bb = rev.Shape.BoundBox
+        if abs(bb.ZMin - ebb.ZMin) < 0.05 and abs(bb.ZMax - ebb.ZMax) < 0.05 and abs(bb.XMax - ebb.XMax) < 0.2:
+            side = rev
+        else:
+            _warn("%s revolution axis looks wrong (%s)" % (prefix, bb)); doc.removeObject(rev.Name)
+    except Exception as e:
+        _warn("%s Part::Revolution failed (%s)" % (prefix, e))
+    if side is None:
+        side = doc.addObject("Part::Feature", prefix + "Side")
+        side.Shape = sk.Shape.revolve(V(0, 0, 0), V(0, 0, 1), 360); doc.recompute()
+    grp.addObject(sk); grp.addObject(side)
+    return sk, side
+
+def plate_face(doc, grp, name, sk):
+    plate = None
+    try:
+        plate = doc.addObject("Part::Face", name)
+        plate.Sources = [sk]; plate.FaceMakerClass = "Part::FaceMakerBullseye"; doc.recompute()
+        if plate.Shape.isNull() or len(plate.Shape.Faces) != 1:
+            raise RuntimeError("Part::Face gave %d faces" % len(plate.Shape.Faces))
+    except Exception as e:
+        _warn("Part::Face failed (%s) - script" % e)
+        if plate is not None: doc.removeObject(plate.Name)
+        plate = doc.addObject("Part::Feature", name)
+        plate.Shape = Part.makeFace(sk.Shape.Wires, "Part::FaceMakerBullseye"); doc.recompute()
+    grp.addObject(sk); grp.addObject(plate)
+    return plate
+
+def inner_wires(plate):
+    f = plate.Shape.Faces[0]
+    ws = [w for w in f.Wires if not w.isSame(f.OuterWire)]
+    ws.sort(key=lambda w: -w.Length)
+    return ws
+
+def sew_surface(doc, grp, name, faces):
+    comp = Part.makeCompound(faces)
+    try: comp.sewShape(1e-3)
+    except Exception:
+        try: comp.sewShape()
+        except Exception as e: _warn("sewShape unavailable: %s" % e)
+    shells = list(comp.Shells)
+    shell = max(shells, key=lambda s: s.Area) if shells else Part.Shell(faces)
+    surf = doc.addObject("Part::Feature", name); surf.Shape = shell; doc.recompute(); grp.addObject(surf)
+    _info("%s: %d faces, area %.0f mm2, valid=%s" % (name, len(shell.Faces), shell.Area, shell.isValid()))
+    return surf
+
+# ------------------------------------------------------------------ solid (thickness) helpers
+def offset_pts(edge, T, n=400):
+    """points of the curve offset by T along (-dz,+dr) in the (r,z) plane"""
+    f, l = edge.FirstParameter, edge.LastParameter
+    pts = []
+    for i in range(n + 1):
+        u = f + (l - f) * i / n
+        p = edge.valueAt(u); t = edge.tangentAt(u)
+        pts.append(V(p.x - t.z * T, 0, p.z + t.x * T))
+    return pts
+
+def interp_edge(pts):
+    b = Part.BSplineCurve(); b.interpolate(pts); return b.toShape()
+
+def revolve_profile(edges):
+    w = Part.Wire(Part.__sortEdges__(edges))
+    if not w.isClosed(): raise RuntimeError("profile not closed")
+    return Part.Face(w).revolve(V(0, 0, 0), V(0, 0, 1), 360)
+
+def ring(wire, T, depth):
+    """sheet ring of thickness T OUTSIDE a closed planar wire, extruded along z by `depth` (signed)"""
+    inner = Part.Face(wire); outer = Part.Face(wire.makeOffset2D(T, 0, False, False, False))
+    return outer.cut(inner).extrude(V(0, 0, depth))
+
+def prism(wire, z0, z1):
+    f = Part.Face(wire); f.translate(V(0, 0, z0 - wire.BoundBox.ZMin)); return f.extrude(V(0, 0, z1 - z0))   # wire may sit at any z
+
+def _add(doc, grp, name, shape):
+    o = doc.getObject(name) or doc.addObject("Part::Feature", name)
+    o.Shape = shape
+    if grp is not None and o not in grp.Group: grp.addObject(o)
+    return o
+
+# ------------------------------------------------------------------ the two sheet parts
+def build_outer(doc, asm):
+    grp = doc.addObject("App::DocumentObjectGroup", "OuterShell_Build")
+    sk, side = spline_revolution(doc, grp, "Cup", OUTER_POLES, OUTER_KNOTS, OUTER_MULTS)
+    top = doc.addObject("Sketcher::SketchObject", "TopPlateSketch")
+    top.addGeometry(Part.Circle(V(0, 0, 0), V(0, 0, 1), R_FLAT), False)
+    arcs, _ = trilobal_geometry(); first = top.GeometryCount
+    for a in arcs:
+        top.addGeometry(Part.ArcOfCircle(Part.Circle(V(a["c"][0], a["c"][1], 0), V(0, 0, 1), a["r"]), a["a0"], a["a1"]), False)
+    try:
+        for kk in range(3):
+            tooth, lobe, tn = first + 2 * kk, first + 2 * kk + 1, first + 2 * ((kk + 1) % 3)
+            top.addConstraint(Sketcher.Constraint("Coincident", tooth, 1, lobe, 1))
+            top.addConstraint(Sketcher.Constraint("Coincident", lobe, 2, tn, 2))
+    except Exception as e: _warn("trilobal constraints skipped: %s" % e)
+    for (hx, hy) in hole_centres():
+        top.addGeometry(Part.Circle(V(hx, hy, 0), V(0, 0, 1), BOLT_D / 2.0), False)
+    doc.recompute()
+    plate = plate_face(doc, grp, "TopPlate", top)
+    iw = inner_wires(plate); tri, holes = iw[0], iw[1:]
+    walls = list(tri.extrude(V(0, 0, -LIP_DEPTH)).Faces) if LIP_DEPTH > 0 else []
+    if HOLE_COLLAR > 0:
+        for h in holes: walls.extend(h.extrude(V(0, 0, -HOLE_COLLAR)).Faces)
+    sew_surface(doc, grp, "CupSurface", list(side.Shape.Faces) + list(plate.Shape.Faces) + walls)
+    # solid with thickness T_OUTER growing INWARD from the scanned outer skin
+    skin = sk.Shape.Edges[0]
+    pts = offset_pts(skin, T_OUTER); off = interp_edge(pts)
+    A = skin.valueAt(skin.FirstParameter); B = skin.valueAt(skin.LastParameter); F, E = pts[0], pts[-1]
+    edges = [skin, Part.makeLine(B, V(0, 0, B.z)), Part.makeLine(V(0, 0, B.z), V(0, 0, B.z - T_OUTER)),
+             Part.makeLine(V(0, 0, B.z - T_OUTER), E), off, Part.makeLine(F, A)]
+    body = revolve_profile(edges)
+    for w in iw: body = body.cut(prism(w, 0.5, -(T_OUTER + 0.5)))
+    if LIP_DEPTH > 0: body = body.fuse(ring(tri, T_OUTER, -LIP_DEPTH))
+    if HOLE_COLLAR > 0:
+        for h in holes: body = body.fuse(ring(h, T_OUTER, -HOLE_COLLAR))
+    body = body.removeSplitter()
+    solid = _add(doc, grp, "OuterSolid", body)
+    asm.addObject(grp)
+    _info("OuterSolid: valid=%s vol=%.0f mm3 closed=%s" % (body.isValid(), body.Volume, body.isClosed()))
+    return dict(solid=solid, inner_edge=off, F=F, E=E, tri=tri, holes=holes, T=T_OUTER)
+
+def build_housing(doc, asm):
+    grp = doc.addObject("App::DocumentObjectGroup", "Housing_Build")
+    sk, side = spline_revolution(doc, grp, "Housing", HOUSING_POLES, HOUSING_KNOTS, HOUSING_MULTS)
+    ps = doc.addObject("Sketcher::SketchObject", "HousingPlateSketch")
+    ps.Placement = App.Placement(V(0, 0, PLATE_Z2), App.Rotation())
+    ps.addGeometry(Part.Circle(V(0, 0, 0), V(0, 0, 1), R_PLATE2), False)
+    dg = d_geometry()
+    ps.addGeometry(Part.ArcOfCircle(Part.Circle(V(dg["c"][0], dg["c"][1], 0), V(0, 0, 1), dg["r"]), dg["a0"], dg["a1"]), False)
+    ps.addGeometry(Part.LineSegment(V(dg["p1"][0], dg["p1"][1], 0), V(dg["p0"][0], dg["p0"][1], 0)), False)
+    try:
+        ps.addConstraint(Sketcher.Constraint("Coincident", 1, 2, 2, 1)); ps.addConstraint(Sketcher.Constraint("Coincident", 2, 2, 1, 1))
+    except Exception as e: _warn("D constraints skipped: %s" % e)
+    doc.recompute()
+    plate = plate_face(doc, grp, "HousingPlate", ps)
+    dw = inner_wires(plate)[0]
+    walls = list(dw.extrude(V(0, 0, D_COLLAR)).Faces) if D_COLLAR > 0 else []
+    sew_surface(doc, grp, "HousingSurface", list(side.Shape.Faces) + list(plate.Shape.Faces) + walls)
+    # solid with thickness T_HOUSING growing OUTWARD from the scanned inner face
+    skin = sk.Shape.Edges[0]
+    pts = offset_pts(skin, T_HOUSING); off = interp_edge(pts)
+    A = skin.valueAt(skin.FirstParameter); B = skin.valueAt(skin.LastParameter); F, E = pts[0], pts[-1]
+    edges = [skin, Part.makeLine(B, E), off, Part.makeLine(F, V(0, 0, F.z)), Part.makeLine(V(0, 0, F.z), V(0, 0, A.z)),
+             Part.makeLine(V(0, 0, A.z), A)]
+    body = revolve_profile(edges)
+    body = body.cut(prism(dw, A.z - 0.5, A.z + T_HOUSING + 0.5))
+    if D_COLLAR > 0: body = body.fuse(ring(dw, T_HOUSING, D_COLLAR))
+    body = body.removeSplitter()
+    solid = _add(doc, grp, "HousingSolid", body)
+    asm.addObject(grp)
+    interior = revolve_profile([skin, Part.makeLine(B, V(0, 0, B.z)), Part.makeLine(V(0, 0, B.z), V(0, 0, A.z)),
+                                Part.makeLine(V(0, 0, A.z), A)])
+    _info("HousingSolid: valid=%s vol=%.0f mm3 closed=%s  rim corner z: inner %.2f outer %.2f" % (body.isValid(), body.Volume, body.isClosed(), B.z, E.z))
+    return dict(solid=solid, top_z=A.z + T_HOUSING, interior=interior, dw=dw)
+
+# ------------------------------------------------------------------ studs, rubber, casting core
+def build_studs(doc, asm):
+    grp = doc.getObject("Studs_Build") or doc.addObject("App::DocumentObjectGroup", "Studs_Build")
+    shapes = []
+    for i, (hx, hy) in enumerate(hole_centres()):
+        c = Part.makeCylinder(STUD_D / 2.0, STUD_EXPOSED + STUD_EMBED, V(hx, hy, -STUD_EMBED))
+        _add(doc, grp, "Stud%d" % (i + 1), c); shapes.append(c)
+    if grp not in asm.Group: asm.addObject(grp)
+    return shapes
+
+def build_rubber(doc, asm, outer, housing, studs):
+    grp = doc.getObject("Rubber_Build") or doc.addObject("App::DocumentObjectGroup", "Rubber_Build")
+    F, E, T = outer["F"], outer["E"], outer["T"]
+    prof = [outer["inner_edge"], Part.makeLine(E, V(0, 0, E.z)), Part.makeLine(V(0, 0, E.z), V(0, 0, F.z)), Part.makeLine(V(0, 0, F.z), F)]
+    vin = revolve_profile(prof)                                  # interior of the outer shell (open at the rim)
+    z_rb = Z_BOT + RUBBER_RECESS
+    vin = vin.cut(Part.makeCylinder(90, 40, V(0, 0, z_rb - 40)))  # recessed bottom face
+    if FILL_BOLT_HOLES:
+        for (hx, hy) in hole_centres():
+            vin = vin.fuse(Part.makeCylinder(BOLT_D / 2.0, T + 1.0, V(hx, hy, -T - 1.0)))
+    void = prism(outer["tri"], 0.5, housing["top_z"])            # trilobal void down to the housing face
+    rub = vin.cut(outer["solid"].Shape).cut(housing["solid"].Shape).cut(housing["interior"]).cut(void)
+    rub = rub.cut(prism(housing["dw"], housing["top_z"] - T_HOUSING - 0.5, housing["top_z"]))   # keep the D hole free of rubber
+    for s in studs: rub = rub.cut(s)
+    rub = rub.removeSplitter()
+    o = _add(doc, grp, "Rubber", rub)
+    if grp not in asm.Group: asm.addObject(grp)
+    _info("Rubber: valid=%s solids=%d vol=%.0f mm3 (%.1f cm3)" % (rub.isValid(), len(rub.Solids), rub.Volume, rub.Volume / 1000.0))
+    return o
+
+def build_core(doc, asm, outer, housing):
+    """Removable casting core (upright coordinates, z = 0 is the shell top face):
+         body      trilobal, drafted, from the housing plate face (z = top_z) up to z = 0, keeps the void open
+         shoulder  flange z = 0 .. SHOULDER_T resting on the shell top face (height index)
+         foot      trilobal column above the shoulder, tall enough that the studs clear the bench when inverted
+         pocket    ring slot around the D collar
+         peg       D-shaped, goes through the housing D hole (registers + centres the housing)"""
+    grp = doc.getObject("CastingCore_Group") or doc.addObject("App::DocumentObjectGroup", "CastingCore_Group")
+    zb, zt = housing["top_z"], 0.0
+    tri, dw = outer["tri"], housing["dw"]
+    d = (zt - zb) * math.tan(math.radians(CORE_DRAFT))
+    wb = tri.makeOffset2D(-(d + CORE_CLEAR), 0, False, False, False); wb.translate(V(0, 0, zb))
+    wt = tri.makeOffset2D(-CORE_CLEAR, 0, False, False, False)
+    body = Part.makeLoft([wb, wt], True)
+    # shoulder outline: trilobal offset outward, limited so it clears the bolt holes / studs
+    clear = min(Part.Vertex(V(hx, hy, 0)).distToShape(tri)[0] - BOLT_D / 2.0 for (hx, hy) in hole_centres())
+    margin = max(0.5, min(SHOULDER_MARGIN, clear - 1.0))
+    sh = Part.Face(tri.makeOffset2D(margin, 0, False, False, False)).extrude(V(0, 0, SHOULDER_T))
+    ft = Part.Face(tri.makeOffset2D(-CORE_CLEAR, 0, False, False, False)); ft.translate(V(0, 0, SHOULDER_T))
+    foot = ft.extrude(V(0, 0, CORE_FOOT))
+    # print-friendly transition: the core is printed upside down (foot end on the bed), so the shoulder's face towards
+    # the foot is an overhang. A straight cone at SHOULDER_ANGLE (steeper than 45 deg) bridges it without supports
+    # (a round fillet would flare out to horizontal at the shoulder edge and sag).
+    over = margin + CORE_CLEAR
+    h = over * math.tan(math.radians(SHOULDER_ANGLE))
+    w1 = tri.makeOffset2D(margin, 0, False, False, False); w1.translate(V(0, 0, SHOULDER_T))
+    w2 = tri.makeOffset2D(-CORE_CLEAR, 0, False, False, False); w2.translate(V(0, 0, SHOULDER_T + h))
+    cone = Part.makeLoft([w1, w2], True, True)
+    core = body.fuse(sh).fuse(foot).fuse(cone).removeSplitter()
+    # pocket (ring) around the D collar, island kept as the peg root
+    zc = dw.BoundBox.ZMin
+    ring_out = Part.Face(dw.makeOffset2D(T_HOUSING + POCKET_CLEAR, 0, False, False, False))
+    island = Part.Face(dw.makeOffset2D(-PEG_CLEAR, 0, False, False, False))
+    for f in (ring_out, island): f.translate(V(0, 0, zb - zc))
+    pocket = ring_out.cut(island).extrude(V(0, 0, D_COLLAR + 0.5))
+    core = core.cut(pocket)
+    isl2 = Part.Face(dw.makeOffset2D(-PEG_CLEAR, 0, False, False, False)); isl2.translate(V(0, 0, zb - zc))
+    peg = isl2.extrude(V(0, 0, -PEG_DEPTH))
+    core = core.fuse(peg).removeSplitter()
+    o = _add(doc, grp, "CastingCore", core)
+    if grp not in asm.Group: asm.addObject(grp)
+    ih = core.common(housing["solid"].Shape).Volume; io = core.common(outer["solid"].Shape).Volume
+    _info("CastingCore: valid=%s solids=%d vol=%.1f cm3 | shoulder margin %.1f mm | overlap housing %.3f, shell %.3f mm3 | total height %.1f mm" % (
+        core.isValid(), len(core.Solids), core.Volume / 1000.0, margin, ih, io, core.BoundBox.ZLength))
+    return o
+
+def make_body(doc, asm, name, base):
+    try:
+        body = doc.addObject("PartDesign::Body", name); asm.addObject(body); body.BaseFeature = base; doc.recompute()
+        _info("%s: PartDesign Body created" % name)
+    except Exception as e:
+        _warn("PartDesign Body %s failed (%s)" % (name, e))
+
+def export_all(doc, folder):
+    import Mesh, MeshPart
+    os.makedirs(folder, exist_ok=True)
+    for fn, n in (("outer_shell", "OuterSolid"), ("housing_top", "HousingSolid"),
+                  ("rubber_original", "Rubber"), ("casting_core", "CastingCore")):
+        o = doc.getObject(n)
+        if o: o.Shape.exportStep(os.path.join(folder, fn + ".step"))
+    c = doc.getObject("CastingCore")
+    if c:
+        m = MeshPart.meshFromShape(Shape=c.Shape, LinearDeflection=0.05, AngularDeflection=0.2)
+        m.write(os.path.join(folder, "casting_core.stl"))
+    doc.saveAs(os.path.join(folder, "StrutIsolator.FCStd"))
+    _info("exported to %s" % folder)
+
+def build_all(with_rubber=True, bodies=True, core=True):
+    doc = App.newDocument("StrutIsolator")
+    asm = doc.addObject("App::Part", "StrutIsolator")
+    outer = build_outer(doc, asm); housing = build_housing(doc, asm)
+    studs = build_studs(doc, asm) if with_rubber else []
+    rub = build_rubber(doc, asm, outer, housing, studs) if with_rubber else None
+    if core and with_rubber: build_core(doc, asm, outer, housing)
+    if bodies:
+        make_body(doc, asm, "Body_OuterShell", outer["solid"]); make_body(doc, asm, "Body_HousingTop", housing["solid"])
+    ov = outer["solid"].Shape.common(housing["solid"].Shape).Volume
+    _info("interference outer/housing: %.4f mm3" % ov)
+    doc.recompute()
+    if EXPORT_DIR: export_all(doc, EXPORT_DIR)
+    try:
+        import FreeCADGui
+        FreeCADGui.SendMsgToActiveView("ViewFit")
+    except Exception: pass
+    return doc
+
+if globals().get("AUTO_BUILD", True):
+    build_all()

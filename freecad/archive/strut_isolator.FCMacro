@@ -1,0 +1,434 @@
+# -*- coding: utf-8 -*-
+"""
+Datsun 280Z strut isolator - two pressed-steel parts reverse-engineered from Revopoint scans    (v3)
+=========================================================================================
+
+    scan 1  1009_01_mesh.ply  ->  OUTER SHELL   (cup with trilobal opening, lip, 3 bolt holes)
+    scan 2  1009_02_mesh.ply  ->  HOUSING TOP   (inner cup with D-shaped shaft hole, rolled-in rim)
+
+Run:  Macro > Macros... > (this file) > Execute        (or paste into the Python console)
+
+Frame: shared axis = global Z through the origin, +Z up.
+    OUTER SHELL  flat top at z = 0, open at the bottom (rim z = -59.3)
+    HOUSING TOP  nested inside, flat plate (with D hole) at z = PLATE_Z2, open at the bottom;
+                 its bottom lip sits LIP_BELOW mm below the outer shell's rim.
+
+Result tree:
+    StrutIsolator (App::Part)
+        Body_OuterShell   PartDesign Body, base feature = thickened solid of the outer shell
+        Body_HousingTop   PartDesign Body, base feature = thickened solid of the housing top
+        OuterShell_Build  sketches / revolution / faces / SURFACE MODEL (CupSurface) / offset (CupThickness)
+        Housing_Build     same for the housing (HousingSurface / HousingThickness)
+    Each sheet part = scanned skin as a surface + Part::Offset(Fill) as the thickness modifier: edit Value.
+
+Both scans only show ONE face of the sheet (outer skin of the outer shell, inner face of the housing),
+so the sheet thickness is an input (T_OUTER / T_HOUSING). Rubber residue on scan 2 was excluded by using only
+surface normals facing the steel's inner face; the rubber's outer cone is NOT part of the model.
+
+Measured (scan 2)   wall r = 26.708 (rms 0.02, round within +-0.03), turns into a ~30 deg cone to the rim,
+                    spline fit 0.077 mm rms.  D hole: R6.36 circle with one flat 4.85 from its centre
+                    (measured centre 0.32 mm off the wall axis - modelled on the axis as you described),
+                    collar 4.9 mm deep. Rim is a square shear cut; the rim end shows t ~ 2.0 mm.
+UNKNOWN             rotation of the D flat relative to the outer shell's bolt holes / trilobal (D_ANGLE).
+"""
+import math
+import FreeCAD as App
+import Part
+import Sketcher
+from FreeCAD import Vector as V
+
+# ==============================================================================================
+# PARAMETERS (mm, degrees)
+# ==============================================================================================
+# ---- OUTER SHELL (scan 1) --------------------------------------------------------------------
+T_OUTER     = 1.0
+LIP_DEPTH   = 8.1        # stamped lip around trilobal opening (free edge measured at 8.1)
+HOLE_COLLAR = 3.2        # collar in each bolt hole (0 = plain hole)
+Z_BOT       = -59.3      # open rim z, top face is z = 0
+R_FLAT      = 42.5       # radius where the wall spline meets the flat top
+PHASE       = 54.9       # angle of bolt hole #1 / first trilobal notch (deg, CCW from +X)
+BOLT_R, BOLT_D, N_HOLES = 34.85, 13.3, 3
+TRI_RHO0, TRI_T, TRI_A  = 21.451, 17.514, 16.371
+
+OUTER_POLES = [(54.850, -59.300), (56.057, -44.586), (51.635, -27.302), (48.721, -8.404),
+               (47.230,  -2.694), (45.261,  -1.008), (43.869,  -0.110), (43.642,  0.000), (R_FLAT, 0.000)]
+OUTER_KNOTS = [0.0, 0.65992, 0.8442, 0.91713, 0.94077, 0.95637, 1.0]
+OUTER_MULTS = [4, 1, 1, 1, 1, 1, 4]
+
+# ---- HOUSING TOP (scan 2) --------------------------------------------------------------------
+T_HOUSING   = 2.0        # sheet thickness (from the rim end; not visible elsewhere)
+LIP_BELOW   = 2.5        # housing bottom lip is this far below the outer shell's rim (you said 2-3 mm)
+D_R         = 6.36       # D hole: circle radius
+D_FLAT      = 4.85       # distance from circle centre to the flat
+D_CENTRE    = (0.0, 0.0) # on the axis (scan: (0.15, -0.28) in this frame, i.e. 0.3 mm off - tolerance)
+D_ANGLE     = -87.3      # direction of the flat's normal, deg CCW from +X  (ARBITRARY relative to part 1!)
+D_COLLAR    = 4.9        # collar depth at the D hole (towards +Z, away from the open end)
+R_PLATE2    = 24.0       # radius where the housing spline meets its flat plate
+W_RIM       = 23.778     # scan-frame height of the lip (plate -> lip), fixes PLATE_Z2 from LIP_BELOW
+PLATE_Z2    = (Z_BOT - LIP_BELOW) + W_RIM
+
+# spline poles measured as (r, w) with w = height above the plate in the scan; z = PLATE_Z2 - w
+_HOUSING_RW = [(24.0, 0.0), (24.721, 0.0), (25.189, 0.01), (26.41, 0.31), (26.981, 3.459), (26.079, 9.587),
+               (29.004, 16.419), (31.424, 20.862), (32.791, 22.944), (33.361, 23.602), (33.303, 23.778)]
+HOUSING_POLES = [(r, PLATE_Z2 - w) for (r, w) in _HOUSING_RW]
+HOUSING_KNOTS = [0.0, 0.06812, 0.08058, 0.10708, 0.42229, 0.73301, 0.89978, 0.9851, 1.0]
+HOUSING_MULTS = [4, 1, 1, 1, 1, 1, 1, 1, 4]
+
+SPLINE_DEG = 3
+
+# ---- optional scan overlays (paths to the PLY files on your machine) ------------------------
+MESH1_PATH = ""          # e.g. "/Users/lee/Downloads/1009_01_mesh.ply"
+MESH2_PATH = ""          # e.g. "/Users/lee/Downloads/1009_02_mesh.ply"
+
+# scan -> local frame (scan 1: x,y,z model frame; scan 2: u,v,w plate frame, see below)
+_SCAN1_TO_MODEL = [
+    [0.999916879, 0.011495940, 0.005837666, -0.040734407],
+    [0.000000000, 0.452770404, -0.891627142, 50.917578719],
+    [-0.012893214, 0.891553030, 0.452732770, -58.025773198]]
+_SCAN2_TO_UVW = [
+    [0.730284784, 0.083079534, -0.678072213, 22.836542630],
+    [0.000000000, 0.992577506, 0.121613708, -4.569340886],
+    [0.683142836, -0.088812641, 0.724864250, -7.819845269]]
+
+
+# ==============================================================================================
+# PURE GEOMETRY (no FreeCAD calls)
+# ==============================================================================================
+def trilobal_geometry():
+    s = TRI_RHO0 + TRI_T
+    d = (s - math.sqrt(4 * (TRI_A + TRI_T) ** 2 - 3 * s * s)) / 2.0
+    Tc = (s, 0.0)
+    Lc = (d * 0.5, d * math.sqrt(3) / 2.0)
+    u = (Lc[0] - Tc[0], Lc[1] - Tc[1])
+    n = math.hypot(*u)
+    u = (u[0] / n, u[1] / n)
+    X = (Tc[0] + u[0] * TRI_T, Tc[1] + u[1] * TRI_T)
+    a_tooth = math.atan2(X[1] - Tc[1], X[0] - Tc[0])
+    a_lobe = math.atan2(X[1] - Lc[1], X[0] - Lc[0])
+    arcs = []
+    for kk in range(3):
+        ph = math.radians(PHASE + 120.0 * kk)
+        Tk = (s * math.cos(ph), s * math.sin(ph))
+        Lk = (d * math.cos(ph + math.pi / 3), d * math.sin(ph + math.pi / 3))
+        arcs.append(dict(kind="tooth", c=Tk, r=TRI_T, a0=a_tooth + ph, a1=(2 * math.pi - a_tooth) + ph))
+        arcs.append(dict(kind="lobe", c=Lk, r=TRI_A, a0=a_lobe + ph, a1=(2 * math.pi / 3 - a_lobe) + ph))
+    return arcs, d
+
+
+def arc_end(arc, which):
+    a = arc["a0"] if which == 0 else arc["a1"]
+    return (arc["c"][0] + arc["r"] * math.cos(a), arc["c"][1] + arc["r"] * math.sin(a))
+
+
+def hole_centres():
+    return [(BOLT_R * math.cos(math.radians(PHASE + 360.0 * k / N_HOLES)),
+             BOLT_R * math.sin(math.radians(PHASE + 360.0 * k / N_HOLES))) for k in range(N_HOLES)]
+
+
+def d_geometry():
+    """D = circle with one flat. Returns centre, R, arc a0/a1 (rad, CCW) and the two flat end points."""
+    phi = math.radians(D_ANGLE)
+    al = math.acos(D_FLAT / D_R)
+    a0, a1 = phi + al, phi + 2 * math.pi - al
+    cx, cy = D_CENTRE
+    p0 = (cx + D_R * math.cos(a0), cy + D_R * math.sin(a0))
+    p1 = (cx + D_R * math.cos(a1), cy + D_R * math.sin(a1))
+    return dict(c=D_CENTRE, r=D_R, a0=a0, a1=a1, p0=p0, p1=p1)
+
+
+# ==============================================================================================
+# FREECAD HELPERS
+# ==============================================================================================
+def _warn(m):
+    App.Console.PrintWarning(m + "\n")
+
+
+def _info(m):
+    App.Console.PrintMessage(m + "\n")
+
+
+def spline_revolution(doc, grp, prefix, poles, knots, mults):
+    """ONE B-spline in the XZ plane (sketch x = radius, sketch y = global Z), revolved 360 deg about Z."""
+    sk = doc.addObject("Sketcher::SketchObject", prefix + "ProfileSketch")
+    sk.Placement = App.Placement(V(0, 0, 0), App.Rotation(V(1, 0, 0), 90))
+    bs = Part.BSplineCurve()
+    bs.buildFromPolesMultsKnots([V(r, z, 0) for (r, z) in poles], mults, knots, False, SPLINE_DEG)
+    sk.addGeometry(bs, False)
+    try:
+        sk.exposeInternalGeometry(0)          # show the control polygon so poles can be dragged
+    except Exception as e:
+        _warn("exposeInternalGeometry skipped: %s" % e)
+    doc.recompute()
+    ebb = sk.Shape.BoundBox                   # expected extents of the revolution
+    side = None
+    try:
+        rev = doc.addObject("Part::Revolution", prefix + "Side")
+        rev.Source = sk
+        rev.AxisLink = (sk, ["V_Axis"])
+        rev.Angle = 360.0
+        rev.Solid = False
+        doc.recompute()
+        bb = rev.Shape.BoundBox
+        if (abs(bb.ZMin - ebb.ZMin) < 0.05 and abs(bb.ZMax - ebb.ZMax) < 0.05 and abs(bb.XMax - ebb.XMax) < 0.05):
+            side = rev
+        else:
+            _warn("%s revolution axis looks wrong (%s) - using script revolve" % (prefix, bb))
+            doc.removeObject(rev.Name)
+    except Exception as e:
+        _warn("%s Part::Revolution failed (%s) - using script revolve" % (prefix, e))
+    if side is None:
+        side = doc.addObject("Part::Feature", prefix + "Side")
+        side.Shape = sk.Shape.revolve(V(0, 0, 0), V(0, 0, 1), 360)
+        doc.recompute()
+    grp.addObject(sk)
+    grp.addObject(side)
+    return sk, side
+
+
+def plate_face(doc, grp, name, sk):
+    """Planar face (outer circle with the cut-outs of the sketch) from a sketch."""
+    plate = None
+    try:
+        plate = doc.addObject("Part::Face", name)
+        plate.Sources = [sk]
+        plate.FaceMakerClass = "Part::FaceMakerBullseye"
+        doc.recompute()
+        if plate.Shape.isNull() or len(plate.Shape.Faces) != 1:
+            raise RuntimeError("Part::Face gave %d faces" % len(plate.Shape.Faces))
+    except Exception as e:
+        _warn("Part::Face failed (%s) - building %s by script" % (e, name))
+        if plate is not None:
+            doc.removeObject(plate.Name)
+        plate = doc.addObject("Part::Feature", name)
+        plate.Shape = Part.makeFace(sk.Shape.Wires, "Part::FaceMakerBullseye")
+        doc.recompute()
+    grp.addObject(sk)
+    grp.addObject(plate)
+    return plate
+
+
+def inner_wires(plate):
+    f = plate.Shape.Faces[0]
+    ws = [w for w in f.Wires if not w.isSame(f.OuterWire)]
+    ws.sort(key=lambda w: -w.Length)
+    return ws
+
+
+def sew_surface(doc, grp, name, faces):
+    comp = Part.makeCompound(faces)
+    try:
+        comp.sewShape(1e-3)
+    except Exception:
+        try:
+            comp.sewShape()
+        except Exception as e:
+            _warn("sewShape unavailable: %s" % e)
+    shells = list(comp.Shells)
+    shell = max(shells, key=lambda s: s.Area) if shells else Part.Shell(faces)
+    surf = doc.addObject("Part::Feature", name)
+    surf.Shape = shell
+    doc.recompute()
+    grp.addObject(surf)
+    _info("%s: %d faces in %d shell(s), area %.0f mm2, valid=%s"
+          % (name, len(shell.Faces), len(shells), shell.Area, shell.isValid()))
+    return surf
+
+
+def thicken(doc, grp, name, surf, T, grows):
+    """Part::Offset with Fill = solid between the scanned skin and a skin offset to its BACK side.
+    grows=True : the wall grows outward past the scanned skin (scan shows the inside face)
+    grows=False: the wall grows inward from the scanned skin (scan shows the outer skin)"""
+    skin = surf.Shape.BoundBox
+    for join in ("Arc", "Intersection"):
+        for sign in (-1.0, 1.0):
+            off = None
+            try:
+                off = doc.addObject("Part::Offset", name)
+                off.Source = surf
+                off.Value = sign * T
+                off.Mode = "Skin"
+                off.Join = join
+                off.Intersection = False
+                off.SelfIntersection = False
+                off.Fill = True
+                doc.recompute()
+                sh = off.Shape
+                ok = (not sh.isNull()) and sh.isValid() and len(sh.Solids) >= 1 and sh.Volume > 0
+                if ok:
+                    bb = sh.BoundBox
+                    ok = abs(sh.Volume / (surf.Shape.Area * T) - 1.0) < 0.25
+                    if grows:
+                        ok = ok and bb.XMax > skin.XMax + 0.5 * T
+                    else:
+                        ok = ok and bb.XMax <= skin.XMax + 0.01 and bb.ZMax <= skin.ZMax + 0.01
+                if ok:
+                    _info("%s ok: Join=%s Value=%+.2f volume=%.0f mm3" % (name, join, off.Value, sh.Volume))
+                    grp.addObject(off)
+                    try:
+                        surf.ViewObject.Visibility = False
+                    except Exception:
+                        pass
+                    return off
+                doc.removeObject(off.Name)
+            except Exception as e:
+                _warn("%s offset attempt (join=%s sign=%+.0f) failed: %s" % (name, join, sign, e))
+                try:
+                    if off is not None:
+                        doc.removeObject(off.Name)
+                except Exception:
+                    pass
+    _warn("Could not build %s. The surface model %s is fine - select it and use Part > Offset 3D object... "
+          "(Fill offset on, try Join=Intersection, Value +/-%.1f)." % (name, surf.Name, T))
+    return None
+
+
+# ==============================================================================================
+# PART 1 : OUTER SHELL
+# ==============================================================================================
+def build_outer(doc, asm):
+    grp = doc.addObject("App::DocumentObjectGroup", "OuterShell_Build")
+    sk, side = spline_revolution(doc, grp, "Cup", OUTER_POLES, OUTER_KNOTS, OUTER_MULTS)
+
+    top = doc.addObject("Sketcher::SketchObject", "TopPlateSketch")        # XY plane, z = 0
+    top.addGeometry(Part.Circle(V(0, 0, 0), V(0, 0, 1), R_FLAT), False)
+    arcs, _ = trilobal_geometry()
+    first = top.GeometryCount
+    for a in arcs:
+        top.addGeometry(Part.ArcOfCircle(Part.Circle(V(a["c"][0], a["c"][1], 0), V(0, 0, 1), a["r"]),
+                                         a["a0"], a["a1"]), False)
+    try:
+        for kk in range(3):
+            tooth, lobe, tnext = first + 2 * kk, first + 2 * kk + 1, first + 2 * ((kk + 1) % 3)
+            top.addConstraint(Sketcher.Constraint("Coincident", tooth, 1, lobe, 1))
+            top.addConstraint(Sketcher.Constraint("Coincident", lobe, 2, tnext, 2))
+    except Exception as e:
+        _warn("trilobal constraints skipped: %s" % e)
+    for (hx, hy) in hole_centres():
+        top.addGeometry(Part.Circle(V(hx, hy, 0), V(0, 0, 1), BOLT_D / 2.0), False)
+    doc.recompute()
+    plate = plate_face(doc, grp, "TopPlate", top)
+
+    walls = []
+    for i, w in enumerate(inner_wires(plate)):          # longest wire = trilobal, rest = bolt holes
+        depth = LIP_DEPTH if i == 0 else HOLE_COLLAR
+        if depth > 0:
+            walls.extend(w.extrude(V(0, 0, -depth)).Faces)
+    lips = doc.addObject("Part::Feature", "LipWalls")
+    lips.Shape = Part.makeCompound(walls) if walls else Part.Shape()
+    doc.recompute()
+    grp.addObject(lips)
+
+    surf = sew_surface(doc, grp, "CupSurface", list(side.Shape.Faces) + list(plate.Shape.Faces) + walls)
+    thick = thicken(doc, grp, "CupThickness", surf, T_OUTER, grows=False)
+    asm.addObject(grp)
+    return thick
+
+
+# ==============================================================================================
+# PART 2 : HOUSING TOP
+# ==============================================================================================
+def build_housing(doc, asm):
+    grp = doc.addObject("App::DocumentObjectGroup", "Housing_Build")
+    sk, side = spline_revolution(doc, grp, "Housing", HOUSING_POLES, HOUSING_KNOTS, HOUSING_MULTS)
+
+    ps = doc.addObject("Sketcher::SketchObject", "HousingPlateSketch")
+    ps.Placement = App.Placement(V(0, 0, PLATE_Z2), App.Rotation())
+    ps.addGeometry(Part.Circle(V(0, 0, 0), V(0, 0, 1), R_PLATE2), False)
+    dg = d_geometry()
+    ps.addGeometry(Part.ArcOfCircle(Part.Circle(V(dg["c"][0], dg["c"][1], 0), V(0, 0, 1), dg["r"]),
+                                    dg["a0"], dg["a1"]), False)                       # 1: round part of the D
+    ps.addGeometry(Part.LineSegment(V(dg["p1"][0], dg["p1"][1], 0), V(dg["p0"][0], dg["p0"][1], 0)), False)  # 2: flat
+    try:
+        ps.addConstraint(Sketcher.Constraint("Coincident", 1, 2, 2, 1))
+        ps.addConstraint(Sketcher.Constraint("Coincident", 2, 2, 1, 1))
+    except Exception as e:
+        _warn("D constraints skipped: %s" % e)
+    doc.recompute()
+    plate = plate_face(doc, grp, "HousingPlate", ps)
+
+    walls = []
+    if D_COLLAR > 0:
+        for w in inner_wires(plate):
+            walls.extend(w.extrude(V(0, 0, +D_COLLAR)).Faces)     # collar goes AWAY from the open end (+Z)
+    col = doc.addObject("Part::Feature", "DCollar")
+    col.Shape = Part.makeCompound(walls) if walls else Part.Shape()
+    doc.recompute()
+    grp.addObject(col)
+
+    surf = sew_surface(doc, grp, "HousingSurface", list(side.Shape.Faces) + list(plate.Shape.Faces) + walls)
+    thick = thicken(doc, grp, "HousingThickness", surf, T_HOUSING, grows=True)
+    asm.addObject(grp)
+    return thick
+
+
+# ==============================================================================================
+# ASSEMBLY, BODIES, CHECKS, OVERLAY
+# ==============================================================================================
+def make_body(doc, asm, name, base):
+    if base is None:
+        return
+    try:
+        body = doc.addObject("PartDesign::Body", name)
+        asm.addObject(body)
+        body.BaseFeature = base
+        doc.recompute()
+        _info("%s: PartDesign Body created (base feature %s)" % (name, base.Name))
+    except Exception as e:
+        _warn("Could not wrap %s in a PartDesign Body (%s) - the solid %s is still in the tree." % (name, e, base.Name))
+
+
+def import_mesh(doc, asm, path, rows, flip_z_to=None):
+    try:
+        import Mesh
+        before = set(o.Name for o in doc.Objects)
+        Mesh.insert(path, doc.Name)
+        M = [list(r) for r in rows]
+        if flip_z_to is not None:               # scan-2 (u,v,w) -> model: x=u, y=-v, z=PLATE_Z2-w  (proper rotation)
+            M[1] = [-v for v in M[1]]
+            M[2] = [-v for v in M[2]]
+            M[2][3] += flip_z_to
+        m = App.Matrix(M[0][0], M[0][1], M[0][2], M[0][3], M[1][0], M[1][1], M[1][2], M[1][3],
+                       M[2][0], M[2][1], M[2][2], M[2][3], 0, 0, 0, 1)
+        for o in [o for o in doc.Objects if o.Name not in before]:
+            o.Placement = App.Placement(m)
+            asm.addObject(o)
+        _info("mesh %s imported and aligned" % path)
+    except Exception as e:
+        _warn("mesh overlay failed for %s: %s" % (path, e))
+
+
+def build():
+    doc = App.newDocument("StrutIsolator")
+    asm = doc.addObject("App::Part", "StrutIsolator")
+
+    t1 = build_outer(doc, asm)
+    t2 = build_housing(doc, asm)
+    make_body(doc, asm, "Body_OuterShell", t1)
+    make_body(doc, asm, "Body_HousingTop", t2)
+
+    if t1 is not None and t2 is not None:
+        try:
+            ov = t1.Shape.common(t2.Shape).Volume
+            _info("interference between the two sheets: %.3f mm3 (should be ~0)" % ov)
+            b1, b2 = t1.Shape.BoundBox, t2.Shape.BoundBox
+            _info("housing lip z = %.2f, outer shell rim z = %.2f  (lip is %.2f mm lower)"
+                  % (b2.ZMin, b1.ZMin, b1.ZMin - b2.ZMin))
+        except Exception as e:
+            _warn("interference check skipped: %s" % e)
+
+    if MESH1_PATH:
+        import_mesh(doc, asm, MESH1_PATH, _SCAN1_TO_MODEL)
+    if MESH2_PATH:
+        import_mesh(doc, asm, MESH2_PATH, _SCAN2_TO_UVW, flip_z_to=PLATE_Z2)
+
+    doc.recompute()
+    try:
+        import FreeCADGui
+        FreeCADGui.SendMsgToActiveView("ViewFit")
+        FreeCADGui.activeDocument().activeView().viewIsometric()
+    except Exception:
+        pass
+    return doc
+
+
+build()

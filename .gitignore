@@ -1,0 +1,4 @@
+*.ply
+*.FCBak
+*.npy
+__pycache__/
