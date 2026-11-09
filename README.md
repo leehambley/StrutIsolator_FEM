@@ -24,7 +24,7 @@ because GitHub rejects files over 100 MB). Unpack with `xz -dk scans/1009_01_mes
 | `freecad/strut_isolator_v6.FCMacro` | **current** macro, rebuilds everything from parameters. Set `EXPORT_DIR` to also write STEP/STL |
 | `freecad/archive/` | earlier macro versions (surface-only models, offset-thickness attempts) |
 | `step/` | outer shell (1.0 mm), housing top (2.0 mm), original rubber volume, casting core |
-| `print/` | casting core STL; `casting_core_print_orientation.stl` is turned foot-down for FDM |
+| `print/` | casting core, inner disc, peg collar and pour dam STLs; `casting_core_print_orientation.stl` is the OLD core turned foot-down (stale, regenerate) |
 | `fem/` | CalculiX results as surface data (`fem_surface.json`), animations, `make_gifs.py` |
 | `images/` | cross-section through the axis |
 | `scans/` | Revopoint PLY scans, xz-compressed (lossless) |
@@ -35,6 +35,7 @@ Shared axis = Z, outer shell top face at z = 0.
 - Outer shell: spline-revolved pressed cup, trilobal opening with stamped 8.1 mm lip, 3 x 13.3 mm bolt holes on r = 34.85 with 3.2 mm collars.
 - Housing top: spline-revolved inner cup, D-shaped shaft hole (R 6.36, flat 4.85) with 4.9 mm collar, rim 2.5 mm below the shell rim.
 - Studs: 3 x M10x1.25, 15 mm exposed. Blind press-in type: a 13.3 mm press-in section sits in the bolt hole and ends flush with the hole collar, so nothing protrudes into the PU. **Assumption.**
+- Pour dam (`PourDam`): printed ring, ID = shell rim OD + 0.3, 3 mm wall, slips 3 mm over the rim and stands 5 mm beyond it (`DAM_H`), so the cup can be overfilled. The shell flares only about 0.25 mm, so the ring is not held by the shell: with the cup inverted the dam hangs from the D peg (its hub rests on the peg tip). Seal the joint with tape and trim the surplus after cure. Three spokes join the ring to a central hub with a D pocket that seats on the core's long D peg (about 31 mm), so dam, core and housing register together; the openings between the spokes are the pour holes.
 - Inner disc: separate plug inside the housing cup (lower cup) filling its top 12 mm, measured from the plate underside when seen from below, with a round 20 mm central hole. A separate collar (OD just under 20 mm, D bore) fills that hole; the core's D peg is 20 mm long, passes through the collar and sticks out 6 mm below it, so disc and collar are held and centred by the peg.
 - Rubber: about 310 cm3 between the sheets, trilobal void hollow down to the housing face, bottom recessed 2 mm (**assumption**).
 - Casting core: draft body down to the housing plate, 6 mm shoulder resting on the shell top face (height index), 50 degree cone under the shoulder

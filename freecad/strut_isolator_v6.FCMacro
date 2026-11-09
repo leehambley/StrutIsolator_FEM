@@ -73,8 +73,17 @@ DISC_H        = 12.0           # mm, inner disc: fills the top 12 mm of the hous
 DISC_HOLE_D   = 20.0           # mm, round central hole in the disc
 COLLAR_CLEAR  = 0.15           # mm, collar OD smaller than the disc hole
 DISC_CLEAR    = 0.3            # mm, disc smaller than the cup interior (fit / print tolerance)
-PEG_STICKOUT  = 6.0            # mm, peg protrudes this far below the disc
-PEG_DEPTH     = T_HOUSING + DISC_H + PEG_STICKOUT   # mm, D peg below the housing plate face (follows DISC_H); 20 mm now
+DAM_H         = 5.0            # mm, pour dam: wall height standing beyond the shell rim (overfill reservoir)
+DAM_OVERLAP   = 3.0            # mm, how far the ring slips over the shell rim (the shell only flares ~0.25 mm, so the ring is NOT held by the shell: the hub rests on the D peg tip)
+DAM_WALL      = 3.0            # mm, ring wall thickness
+HUB_T         = 4.0            # mm, dam hub/spider thickness (sits beyond the dam's far edge)
+HUB_R         = 11.0           # mm, hub outer radius (D peg is 6.36 R)
+HUB_POCKET    = 3.0            # mm, depth of the D pocket in the hub (registers the dam on the core's D peg)
+HUB_FIT       = 0.3            # mm, peg tip stops this far short of the pocket bottom
+N_SPOKES      = 3
+SPOKE_W       = 6.0            # mm; the openings between the spokes are the pour holes
+DAM_CLEAR     = 0.3            # mm, radial clearance to the shell rim OD (tape/seal the joint)
+PEG_DEPTH     = (PLATE_Z2 + T_HOUSING) - (Z_BOT - DAM_H - HUB_POCKET + HUB_FIT)   # mm, D peg below the housing plate face: long enough to seat in the dam hub (follows DISC_H/DAM_H)
 PEG_CLEAR     = 0.20           # mm, peg smaller than the D hole
 POCKET_CLEAR  = 0.25           # mm, pocket around the D collar
 
@@ -243,7 +252,7 @@ def build_outer(doc, asm):
     solid = _add(doc, grp, "OuterSolid", body)
     asm.addObject(grp)
     _info("OuterSolid: valid=%s vol=%.0f mm3 closed=%s" % (body.isValid(), body.Volume, body.isClosed()))
-    return dict(solid=solid, inner_edge=off, F=F, E=E, tri=tri, holes=holes, T=T_OUTER)
+    return dict(solid=solid, inner_edge=off, F=F, E=E, tri=tri, holes=holes, T=T_OUTER, skin=skin)
 
 def build_housing(doc, asm):
     grp = doc.addObject("App::DocumentObjectGroup", "Housing_Build")
@@ -381,6 +390,32 @@ def build_disc(doc, asm, housing):
         disc.isValid(), len(disc.Solids), disc.Volume / 1000.0, disc.BoundBox.ZMin, disc.BoundBox.ZMax, disc.BoundBox.XLength))
     return o
 
+def build_dam(doc, asm, outer, housing):
+    """Pour dam (separate printed ring): slips over the shell rim and stands DAM_H mm beyond it so the cup can be
+    overfilled and the surplus PU is held back; trim/sand the surplus flush after cure. Upright coordinates:
+    the shell rim is at z = Z_BOT, the ring extends from Z_BOT - DAM_H up to Z_BOT + DAM_OVERLAP."""
+    grp = doc.getObject("CastingCore_Group") or doc.addObject("App::DocumentObjectGroup", "CastingCore_Group")
+    dw = housing["dw"]
+    r_in = OUTER_POLES[0][0] + DAM_CLEAR
+    overlap = DAM_OVERLAP
+    z0 = Z_BOT - DAM_H
+    h = DAM_H + overlap
+    ringS = Part.makeCylinder(r_in + DAM_WALL, h, V(0, 0, z0)).cut(Part.makeCylinder(r_in, h, V(0, 0, z0)))
+    # hub + spokes on the far end of the ring; hub has a D pocket that registers on the core's long D peg
+    zh = z0 - HUB_T
+    hub = Part.makeCylinder(HUB_R, HUB_T, V(0, 0, zh))
+    for k in range(N_SPOKES):
+        a = math.radians(PHASE + 360.0 * k / N_SPOKES)
+        sp = Part.makeBox(r_in + 1.0, SPOKE_W, HUB_T, V(0, -SPOKE_W / 2.0, zh))
+        sp.rotate(V(0, 0, 0), V(0, 0, 1), math.degrees(a)); hub = hub.fuse(sp)
+    dpk = dw.makeOffset2D(PEG_CLEAR, 0, False, False, False)
+    hub = hub.cut(prism(dpk, z0 - HUB_POCKET, z0 + 0.5))
+    ringS = ringS.fuse(hub).removeSplitter()
+    _add(doc, grp, "PourDam", ringS)
+    ov = ringS.common(outer["solid"].Shape).Volume
+    _info("PourDam: valid=%s vol=%.1f cm3 | ID %.2f OD %.1f | overlap with shell %.3f mm3 (should be ~0)" % (
+        ringS.isValid(), ringS.Volume / 1000.0, 2 * r_in, 2 * (r_in + DAM_WALL), ov))
+
 def make_body(doc, asm, name, base):
     try:
         body = doc.addObject("PartDesign::Body", name); asm.addObject(body); body.BaseFeature = base; doc.recompute()
@@ -392,10 +427,10 @@ def export_all(doc, folder):
     import Mesh, MeshPart
     os.makedirs(folder, exist_ok=True)
     for fn, n in (("outer_shell", "OuterSolid"), ("housing_top", "HousingSolid"),
-                  ("rubber_original", "Rubber"), ("casting_core", "CastingCore"), ("inner_disc", "InnerDisc"), ("peg_collar", "PegCollar")):
+                  ("rubber_original", "Rubber"), ("casting_core", "CastingCore"), ("inner_disc", "InnerDisc"), ("peg_collar", "PegCollar"), ("pour_dam", "PourDam")):
         o = doc.getObject(n)
         if o: o.Shape.exportStep(os.path.join(folder, fn + ".step"))
-    for fn, n in (("casting_core", "CastingCore"), ("inner_disc", "InnerDisc"), ("peg_collar", "PegCollar")):
+    for fn, n in (("casting_core", "CastingCore"), ("inner_disc", "InnerDisc"), ("peg_collar", "PegCollar"), ("pour_dam", "PourDam")):
         c = doc.getObject(n)
         if c:
             m = MeshPart.meshFromShape(Shape=c.Shape, LinearDeflection=0.05, AngularDeflection=0.2)
@@ -410,7 +445,7 @@ def build_all(with_rubber=True, bodies=True, core=True):
     studs = build_studs(doc, asm) if with_rubber else []
     rub = build_rubber(doc, asm, outer, housing, studs) if with_rubber else None
     if core and with_rubber:
-        build_core(doc, asm, outer, housing); build_disc(doc, asm, housing)
+        build_core(doc, asm, outer, housing); build_disc(doc, asm, housing); build_dam(doc, asm, outer, housing)
     if bodies:
         make_body(doc, asm, "Body_OuterShell", outer["solid"]); make_body(doc, asm, "Body_HousingTop", housing["solid"])
     ov = outer["solid"].Shape.common(housing["solid"].Shape).Volume
