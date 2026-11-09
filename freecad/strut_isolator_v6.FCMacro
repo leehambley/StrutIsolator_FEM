@@ -58,9 +58,10 @@ SPLINE_DEG = 3
 
 STUD_D        = 10.0           # M10x1.25 (modelled as plain cylinder)
 STUD_EXPOSED  = 15.0           # above the shell top face (z = 0)
-STUD_EMBED    = 22.0           # below z = 0 inside the rubber  (ASSUMPTION - tune)
+STUD_HEAD_D   = BOLT_D         # press-in (knurled) section fills the bolt hole
+STUD_EMBED    = HOLE_COLLAR    # BLIND press-in stud: ends flush with the bottom of the hole collar, nothing protrudes into the PU
 RUBBER_RECESS = 2.0            # rubber bottom face sits this far above the outer shell rim (ASSUMPTION)
-FILL_BOLT_HOLES = True         # rubber fills the annulus between stud and bolt-hole collar
+FILL_BOLT_HOLES = False        # press-in stud occupies the hole, so no rubber there
 
 CORE_DRAFT    = 1.5            # deg, makes the core pull out of the cured PU
 CORE_CLEAR    = 0.15           # mm, body smaller than the steel opening (print tolerance)
@@ -68,7 +69,12 @@ SHOULDER_T    = 6.0            # mm, flange resting on the shell top face (z = 0
 SHOULDER_MARGIN = 4.0          # mm, flange outline = trilobal offset outward (auto-reduced to clear the studs)
 SHOULDER_ANGLE = 50.0         # deg from horizontal of the conical fillet under the shoulder (>= 45 prints without support)
 CORE_FOOT     = 26.0           # mm of foot above the shoulder (stands on the bench when inverted)
-PEG_DEPTH     = 10.0           # mm, D peg below the housing plate face (into the housing interior)
+DISC_H        = 12.0           # mm, inner disc: fills the top 12 mm of the housing cup (measured down from the plate underside)
+DISC_HOLE_D   = 20.0           # mm, round central hole in the disc
+COLLAR_CLEAR  = 0.15           # mm, collar OD smaller than the disc hole
+DISC_CLEAR    = 0.3            # mm, disc smaller than the cup interior (fit / print tolerance)
+PEG_STICKOUT  = 6.0            # mm, peg protrudes this far below the disc
+PEG_DEPTH     = T_HOUSING + DISC_H + PEG_STICKOUT   # mm, D peg below the housing plate face (follows DISC_H); 20 mm now
 PEG_CLEAR     = 0.20           # mm, peg smaller than the D hole
 POCKET_CLEAR  = 0.25           # mm, pocket around the D collar
 
@@ -278,7 +284,9 @@ def build_studs(doc, asm):
     grp = doc.getObject("Studs_Build") or doc.addObject("App::DocumentObjectGroup", "Studs_Build")
     shapes = []
     for i, (hx, hy) in enumerate(hole_centres()):
-        c = Part.makeCylinder(STUD_D / 2.0, STUD_EXPOSED + STUD_EMBED, V(hx, hy, -STUD_EMBED))
+        c = Part.makeCylinder(STUD_D / 2.0, STUD_EXPOSED, V(hx, hy, 0))                      # threaded shank above the shell
+        c = c.fuse(Part.makeCylinder(STUD_HEAD_D / 2.0, STUD_EMBED, V(hx, hy, -STUD_EMBED)))  # blind press-in section in the hole
+        c = c.removeSplitter()
         _add(doc, grp, "Stud%d" % (i + 1), c); shapes.append(c)
     if grp not in asm.Group: asm.addObject(grp)
     return shapes
@@ -349,6 +357,30 @@ def build_core(doc, asm, outer, housing):
         core.isValid(), len(core.Solids), core.Volume / 1000.0, margin, ih, io, core.BoundBox.ZLength))
     return o
 
+def build_disc(doc, asm, housing):
+    """Second disc (separate part, upright coordinates): plug inside the housing cup filling its top DISC_H mm
+    (top = nearest the plate when the cup is seen from below). Round DISC_HOLE_D central hole; PegCollar (separate part) fills it and has the D bore for the core's long D peg."""
+    grp = doc.getObject("CastingCore_Group") or doc.addObject("App::DocumentObjectGroup", "CastingCore_Group")
+    z_top = housing["top_z"] - T_HOUSING                      # underside of the housing plate
+    slab = Part.makeCylinder(100, DISC_H, V(0, 0, z_top - DISC_H))
+    disc = housing["interior"].common(slab)
+    try: disc = disc.makeOffsetShape(-DISC_CLEAR, 1e-3)
+    except Exception as e: _warn("disc clearance offset failed (%s)" % e)
+    dw = housing["dw"]
+    hole = Part.makeCylinder(DISC_HOLE_D / 2.0, DISC_H + 1.5, V(dw.BoundBox.Center.x, dw.BoundBox.Center.y, z_top - DISC_H - 1.0))
+    disc = disc.cut(hole).removeSplitter()                 # round 20 mm hole through the disc
+    o = _add(doc, grp, "InnerDisc", disc)
+    # collar: round OD fits the disc hole, D bore takes the core's D peg
+    cz = z_top - DISC_H
+    col = Part.makeCylinder(DISC_HOLE_D / 2.0 - COLLAR_CLEAR, DISC_H, V(dw.BoundBox.Center.x, dw.BoundBox.Center.y, cz))
+    col = col.cut(prism(dw.makeOffset2D(-PEG_CLEAR + 0.15, 0, False, False, False), cz - 1.0, cz + DISC_H + 1.0)).removeSplitter()
+    _add(doc, grp, "PegCollar", col)
+    _info("PegCollar: valid=%s vol=%.2f cm3 | OD %.2f, h %.1f" % (col.isValid(), col.Volume / 1000.0, col.BoundBox.XLength, DISC_H))
+    if grp not in asm.Group: asm.addObject(grp)
+    _info("InnerDisc: valid=%s solids=%d vol=%.1f cm3 | z %.1f .. %.1f | max dia %.1f mm" % (
+        disc.isValid(), len(disc.Solids), disc.Volume / 1000.0, disc.BoundBox.ZMin, disc.BoundBox.ZMax, disc.BoundBox.XLength))
+    return o
+
 def make_body(doc, asm, name, base):
     try:
         body = doc.addObject("PartDesign::Body", name); asm.addObject(body); body.BaseFeature = base; doc.recompute()
@@ -360,13 +392,14 @@ def export_all(doc, folder):
     import Mesh, MeshPart
     os.makedirs(folder, exist_ok=True)
     for fn, n in (("outer_shell", "OuterSolid"), ("housing_top", "HousingSolid"),
-                  ("rubber_original", "Rubber"), ("casting_core", "CastingCore")):
+                  ("rubber_original", "Rubber"), ("casting_core", "CastingCore"), ("inner_disc", "InnerDisc"), ("peg_collar", "PegCollar")):
         o = doc.getObject(n)
         if o: o.Shape.exportStep(os.path.join(folder, fn + ".step"))
-    c = doc.getObject("CastingCore")
-    if c:
-        m = MeshPart.meshFromShape(Shape=c.Shape, LinearDeflection=0.05, AngularDeflection=0.2)
-        m.write(os.path.join(folder, "casting_core.stl"))
+    for fn, n in (("casting_core", "CastingCore"), ("inner_disc", "InnerDisc"), ("peg_collar", "PegCollar")):
+        c = doc.getObject(n)
+        if c:
+            m = MeshPart.meshFromShape(Shape=c.Shape, LinearDeflection=0.05, AngularDeflection=0.2)
+            m.write(os.path.join(folder, fn + ".stl"))
     doc.saveAs(os.path.join(folder, "StrutIsolator.FCStd"))
     _info("exported to %s" % folder)
 
@@ -376,7 +409,8 @@ def build_all(with_rubber=True, bodies=True, core=True):
     outer = build_outer(doc, asm); housing = build_housing(doc, asm)
     studs = build_studs(doc, asm) if with_rubber else []
     rub = build_rubber(doc, asm, outer, housing, studs) if with_rubber else None
-    if core and with_rubber: build_core(doc, asm, outer, housing)
+    if core and with_rubber:
+        build_core(doc, asm, outer, housing); build_disc(doc, asm, housing)
     if bodies:
         make_body(doc, asm, "Body_OuterShell", outer["solid"]); make_body(doc, asm, "Body_HousingTop", housing["solid"])
     ov = outer["solid"].Shape.common(housing["solid"].Shape).Volume
